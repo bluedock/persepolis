@@ -65,7 +65,7 @@ class Download():
         self.retry = int(main_window.persepolis_setting.value('settings/max-tries'))
         self.retry_wait = int(main_window.persepolis_setting.value('settings/retry-wait'))
         self.python_request_chunk_size = int(main_window.persepolis_setting.value('settings/chunk-size'))
-        self.lock = False
+        self.lock = threading.Lock()
         self.sleep_for_speed_limiting = 0
         self.not_converted_download_speed = 0
         self.download_percent = 0
@@ -98,19 +98,30 @@ class Download():
 
         # check if user set proxy
         if self.ip:
-            ip_port = '://' + str(self.ip) + ":" + str(self.port)
-            if self.proxy_user:
-                ip_port = ('://' + self.proxy_user + ':' + self.proxy_passwd + '@' + ip_port)
-            if self.proxy_type == 'socks5':
-                ip_port = 'socks5' + ip_port
-            else:
-                ip_port = 'http' + ip_port
+            # Validate proxy components
+            try:
+                proxy_port = int(self.port)
+                if not (1 <= proxy_port <= 65535):
+                    raise ValueError("Invalid proxy port")
+            except (ValueError, TypeError):
+                logger.sendToLog('Invalid proxy port, ignoring proxy - GID: ' + self.gid, 'DOWNLOAD ERROR')
+                self.ip = None
+                proxy_port = None
 
-            proxies = {'http': ip_port,
-                       'https': ip_port}
+            if self.ip and proxy_port is not None:
+                ip_port = '://' + str(self.ip) + ":" + str(proxy_port)
+                if self.proxy_user:
+                    ip_port = ('://' + self.proxy_user + ':' + self.proxy_passwd + '@' + ip_port)
+                if self.proxy_type == 'socks5':
+                    ip_port = 'socks5' + ip_port
+                else:
+                    ip_port = 'http' + ip_port
 
-            # set proxy to the session
-            self.requests_session.proxies.update(proxies)
+                proxies = {'http': ip_port,
+                           'https': ip_port}
+
+                # set proxy to the session
+                self.requests_session.proxies.update(proxies)
 
         # check if download session needs authenthication
         if self.download_user:
@@ -339,9 +350,14 @@ class Download():
                             rename = True
 
                     # control file is corrupted.
-                    except Exception as e:
-                        logger.sendToLog(str(e) + ' - GID: ' + self.gid, 'DOWNLOAD ERROR')
+                    except (json.JSONDecodeError, KeyError, OSError) as e:
+                        logger.sendToLog('Control file corrupted, starting fresh download: ' + str(e) + ' - GID: ' + self.gid, 'DOWNLOAD ERROR')
                         self.resume = False
+                        # Delete corrupted control file
+                        try:
+                            os.remove(self.control_json_file_path)
+                        except OSError:
+                            pass
 
         if self.resuming_suppurt is False:
             self.resume = False
@@ -399,25 +415,25 @@ class Download():
                     # compare free disk space and file_size
                     if free_space >= self.file_size:
 
-                        # sets the size of each chunk to 1MiB
-                        CHUNK_SIZE = (1024 ** 2)
-                        # creates a byte string of zeroes with a size of 1MiB.
-                        # These bytes will be used for writing to the file later.
-                        zero_chunk = b'\0' * CHUNK_SIZE
-                        # This variable indicates how many bytes still need to be written.
-                        remaining = self.file_size
+                        # Use seek to pre-allocate file space efficiently (sparse file)
+                        # This is much faster than writing zeros for large files
+                        try:
+                            fp.seek(self.file_size - 1)
+                            fp.write(b'\0')
+                            fp.flush()
+                            os.fsync(fp.fileno())
+                        except (OSError, IOError) as e:
+                            # Fallback to chunked writing if seek fails (e.g., filesystem doesn't support sparse files)
+                            logger.sendToLog('Sparse file creation failed, using chunked write: ' + str(e) + ' - GID: ' + self.gid, 'DOWNLOADS')
+                            # sets the size of each chunk to 1MiB
+                            CHUNK_SIZE = (1024 ** 2)
+                            zero_chunk = b'\0' * CHUNK_SIZE
+                            remaining = self.file_size
 
-                        # continue the loop until writing ends.
-                        while remaining > 0 and self.download_status != 'stopped':
-                            # determines how much data should be written in this iteration.
-                            # This value can be equal to CHUNK_SIZE,
-                            # but if remaining is less than CHUNK_SIZE, only the remaining amount will be written.
-                            to_write = min(CHUNK_SIZE, remaining)
-
-                            # writes the zero data up to the calculated amount (to_write) to the file.
-                            fp.write(zero_chunk[:to_write])
-                            # updates the remaining amount to indicate how much of the file still needs to be written.
-                            remaining -= to_write
+                            while remaining > 0 and self.download_status != 'stopped':
+                                to_write = min(CHUNK_SIZE, remaining)
+                                fp.write(zero_chunk[:to_write])
+                                remaining -= to_write
 
                         if self.download_status != 'stopped':
                             logger.sendToLog('Empty file has been created!' + ' - GID: ' + self.gid, 'DOWNLOADS')
@@ -517,22 +533,29 @@ class Download():
         end_time = time.perf_counter()
         # this loop repeated every 0.5 second.
         while self.download_status == 'downloading' or self.download_status == 'paused':
-            diffrence_time = time.perf_counter() - end_time
+            current_time = time.perf_counter()
+            diffrence_time = current_time - end_time
+            # Prevent division by zero
+            if diffrence_time <= 0:
+                time.sleep(0.1)
+                continue
             diffrence_size = self.downloaded_size - last_download_value
             diffrence_size_converted, speed_unit = humanReadableSize(diffrence_size, 'speed')
-            download_speed = round(float(diffrence_size_converted) / diffrence_time,
-                                   2)
+            download_speed = round(float(diffrence_size_converted) / diffrence_time, 2)
             self.download_speed_str = (str(download_speed) + " " + speed_unit + "/s")
             not_converted_download_speed = diffrence_size / diffrence_time
             try:
                 # estimated time the download will be completed.
-                eta_second = (self.file_size - self.downloaded_size) / not_converted_download_speed
+                if not_converted_download_speed > 0:
+                    eta_second = (self.file_size - self.downloaded_size) / not_converted_download_speed
+                else:
+                    eta_second = 0
             except Exception:
                 eta_second = 0
 
             self.eta = convertTime(eta_second)
 
-            end_time = time.perf_counter()
+            end_time = current_time
             last_download_value = self.downloaded_size
 
             time.sleep(2)
@@ -548,26 +571,24 @@ class Download():
 
     # threadHandler asks new part for download from this method.
     def askForNewPart(self):
-        self.lock = True
-        for i in range(0, self.number_of_parts):
-            # Check that this part is not being downloaded or it is not complete.
-            # Check that the number of retries of this part has not reached the set limit.
-            if (self.download_infromation_list[i][2] not in ['complete', 'downloading']) and (self.download_infromation_list[i][3] != self.retry):
+        with self.lock:
+            for i in range(0, self.number_of_parts):
+                # Check that this part is not being downloaded or it is not complete.
+                # Check that the number of retries of this part has not reached the set limit.
+                if (self.download_infromation_list[i][2] not in ['complete', 'downloading']) and (self.download_infromation_list[i][3] != self.retry):
 
-                # set 'downloding' status for this part
-                self.download_infromation_list[i][2] = 'downloading'
+                    # set 'downloading' status for this part
+                    self.download_infromation_list[i][2] = 'downloading'
 
-                # add 1 to retry number for this part
-                self.download_infromation_list[i][3] += 1
+                    # add 1 to retry number for this part
+                    self.download_infromation_list[i][3] += 1
 
-                # number of retries can't be less than 0
-                if self.download_infromation_list[i][3] < 0:
-                    self.download_infromation_list[i][3] = 0
+                    # number of retries can't be less than 0
+                    if self.download_infromation_list[i][3] < 0:
+                        self.download_infromation_list[i][3] = 0
 
-                self.lock = False
-                return i
+                    return i
 
-        self.lock = False
         return None
 
     # The below code is used for each chunk of file handled
@@ -797,10 +818,14 @@ class Download():
                 error_message2 = str(error)
                 self.download_infromation_list[part_number][2] = 'error'
 
-            except Exception as error:
+            except (requests.exceptions.RequestException, OSError, IOError) as error:
                 error_message = 'Error'
                 error_message2 = str(error)
                 self.download_infromation_list[part_number][2] = 'error'
+            except (KeyboardInterrupt, SystemExit):
+                # Re-raise critical exceptions
+                self.download_status = 'stopped'
+                raise
 
             if error_message:
                 self.error_message = error_message
@@ -945,10 +970,19 @@ class Download():
         # get current time
         sigma_now = self.nowTime()
 
+        # Safety: prevent infinite loop - max 24 hours of waiting
+        max_iterations = 48000  # 24 hours / 2.1 seconds
+        iteration = 0
+
         # this loop is continuing until download time arrival!
-        while sigma_start != sigma_now and self.download_status == 'scheduled':
+        while sigma_start != sigma_now and self.download_status == 'scheduled' and iteration < max_iterations:
             time.sleep(2.1)
             sigma_now = self.nowTime()
+            iteration += 1
+
+        if iteration >= max_iterations:
+            logger.sendToLog("Start time wait exceeded maximum (24h), canceling download - GID: " + self.gid, "DOWNLOADS")
+            self.downloadStop()
 
     # This method will stop the download when the end_time is reached.
     def endTime(self):
@@ -958,11 +992,19 @@ class Download():
         # get current time
         sigma_now = self.nowTime()
 
+        # Safety: prevent infinite loop - max 24 hours of waiting
+        max_iterations = 48000  # 24 hours / 2.1 seconds
+        iteration = 0
+
         # while current time is not equal to end_time, continue the loop
-        while sigma_end != sigma_now and (self.download_status not in ['stopped', 'error']):
+        while sigma_end != sigma_now and (self.download_status not in ['stopped', 'error']) and iteration < max_iterations:
             # get current time
             sigma_now = self.nowTime()
             time.sleep(2.1)
+            iteration += 1
+
+        if iteration >= max_iterations:
+            logger.sendToLog("End time wait exceeded maximum (24h), stopping download - GID: " + self.gid, "DOWNLOADS")
 
         # Time is up!
         if self.download_status not in ['stopped', 'error']:
@@ -1171,17 +1213,16 @@ class Download():
     # this function returns folder of download according to file extension
     def findDownloadPath(self, file_name, download_path, subfolder):
 
+        # Remove query parameters from filename first
+        if '?' in file_name:
+            file_name = file_name.split('?')[0]
+
         file_name_split = file_name.split('.')
-        file_extension = file_name_split[-1]
+        file_extension = file_name_split[-1] if len(file_name_split) > 1 else ''
 
         # convert extension letters to lower case
         # for example "JPG" will be converted in "jpg"
         file_extension = file_extension.lower()
-
-        # remove query from file_extension if existed
-        # if '?' in file_extension, then file_name contains query components.
-        if '?' in file_extension:
-            file_extension = file_extension.split('?')[0]
 
         # audio formats
         audio = ['act', 'aiff', 'aac', 'amr', 'ape', 'au', 'awb', 'dct', 'dss', 'dvf', 'flac', 'gsm', 'iklax', 'ivs', 'm4a',
